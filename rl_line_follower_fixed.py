@@ -260,7 +260,7 @@ EPSILON_DECAY = 0.93        # 0.93 ** 45 ~= 0.038 -> reaches EPSILON_MIN
 SEED_EPSILON  = 0.3         # FWD-R exploration after seed_fr (fine-tune only)
 
 DEFAULT_EPISODES     = 45
-EPISODE_MAX_STEPS    = 400
+EPISODE_MAX_STEPS    = 100
 MIN_TRAINED_EPISODES = 10   # a mode's own Q-values are used in `run` from here
 
 STEP_SLEEP           = 0.02 # real control period is ~50-80 ms incl. sysfs I/O

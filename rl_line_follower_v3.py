@@ -61,7 +61,7 @@ CALIB_JSON = os.path.join(HERE, "calibration.json")
 Q_TABLE_PATH = os.path.join(HERE, "q_table_v3.pkl")
 WORKING_Q_TABLE_PATH = os.path.join(HERE, "q_table_working.pkl")
 
-DEFAULT_COMMAND = ["status"]
+DEFAULT_COMMAND = ["run"]
 
 # =====================================================================
 # 1. CALIBRATION (same file and defaults as rl_line_follower_fixed.py)
@@ -181,7 +181,7 @@ def epsilon(iterations):
 # 4. MOTION SETTINGS (speed %, seconds; open-loop values -- tune)
 # =====================================================================
 FWD_MIN_SPEED = 18     # forward speed after a turn
-FWD_MAX_SPEED = 30     # ramps up to this while staying on the edge
+FWD_MAX_SPEED = 22     # ramps up to this while staying on the edge
 FWD_RAMP      = 2      # added per consecutive forward action
 FORWARD_TIME  = 0.25
 TURN_SPEED    = 11     # pivot component
@@ -196,7 +196,7 @@ RECOVERY_TRIES = 4
 OBSTACLE_PROXIMITY = 25
 DETOUR_BACKUP_TIME = 2.0
 DETOUR_TURN_SPEED  = 20
-DETOUR_TURN_TIME   = 1.8   # ~180 deg pivot at DETOUR_TURN_SPEED (0.9 s was ~90) -- tune
+DETOUR_TURN_TIME   = 5.0   # ~180 deg pivot at DETOUR_TURN_SPEED (0.9 s was ~90) -- tune
 
 # =====================================================================
 # HARDWARE -- opened lazily so status / table work off the brick

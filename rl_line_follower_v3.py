@@ -194,9 +194,9 @@ CREEP_TIME     = 0.5
 RECOVERY_TRIES = 4
 
 OBSTACLE_PROXIMITY = 25
-DETOUR_BACKUP_TIME = 2.0
 DETOUR_TURN_SPEED  = 20
-DETOUR_TURN_TIME   = 1.8   # ~180 deg pivot at DETOUR_TURN_SPEED (0.9 s was ~90) -- tune
+DETOUR_TURN_TIME   = 0.9
+DETOUR_ARC_TIME    = 1.9
 
 # =====================================================================
 # HARDWARE -- opened lazily so status / table work off the brick
@@ -387,22 +387,18 @@ def obstacle_ahead():
     return ir_sensor is not None and ir_sensor.proximity < OBSTACLE_PROXIMITY
 
 
-def avoid_obstacle(mode):
-    """Back up, then pivot ~180 deg toward the line's side so the sensor
-    sweeps across the line and ends on the same edge, heading back.
-    Returns the mode for the new heading: the line is now on the other
-    side of the sensor. find_edge() afterwards confirms it."""
+def avoid_obstacle():
     sound.beep()
     stop()
     time.sleep(0.2)
     drive(-CREEP_SPEED, -CREEP_SPEED)
-    time.sleep(DETOUR_BACKUP_TIME)
+    time.sleep(2.0)
     stop()
-    turn = DETOUR_TURN_SPEED if mode else -DETOUR_TURN_SPEED   # line on right -> turn right
-    drive(turn, -turn)
+    drive(-DETOUR_TURN_SPEED, DETOUR_TURN_SPEED)
     time.sleep(DETOUR_TURN_TIME)
+    drive(int(DETOUR_TURN_SPEED * 1.4), int(DETOUR_TURN_SPEED * 0.6))
+    time.sleep(DETOUR_ARC_TIME)
     stop()
-    return not mode
 
 
 # =====================================================================
@@ -528,9 +524,8 @@ def run(duration_sec):
             print("Forward.")
 
         if direction == 1 and obstacle_ahead():
-            print("Obstacle! Turning around ({})...".format(
-                "right" if mode else "left"))
-            mode = avoid_obstacle(mode)
+            print("Obstacle! Detouring...")
+            avoid_obstacle()
             light, mode = find_edge(mode, direction)
             if light is None:
                 print("Could not re-find the line after the detour.")

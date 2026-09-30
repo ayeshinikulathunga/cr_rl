@@ -2,8 +2,8 @@
   "timestamp": "2026-07-30 23:58:55",
   "LOST_LINE_LOW": 9,
   "samples": 1044,
-  "TARGET_INTENSITY": 26,
-  "line_level": 48,
-  "LOST_LINE_HIGH": 43,
-  "floor_level": 4
+  "TARGET_INTENSITY": 20,
+  "line_level": 36,
+  "LOST_LINE_HIGH": 31,
+  "floor_level": 5
 }

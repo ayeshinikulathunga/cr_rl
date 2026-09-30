@@ -181,7 +181,7 @@ def epsilon(iterations):
 # 4. MOTION SETTINGS (speed %, seconds; open-loop values -- tune)
 # =====================================================================
 FWD_MIN_SPEED = 18     # forward speed after a turn
-FWD_MAX_SPEED = 30     # ramps up to this while staying on the edge
+FWD_MAX_SPEED = 24     # ramps up to this while staying on the edge
 FWD_RAMP      = 2      # added per consecutive forward action
 FORWARD_TIME  = 0.25
 TURN_SPEED    = 11     # pivot component

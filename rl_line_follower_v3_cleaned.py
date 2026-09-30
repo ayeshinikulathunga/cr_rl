@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""
+Q-learning edge-following line follower for LEGO Mindstorms EV3 (ev3dev2).
+
+Design
+------
+* States:  (mode, light) where light is BLACK, MIDDLE or WHITE, derived
+  from the calibrated reflected-light intensity, and mode records which
+  side of the sensor the line is on.
+* Actions: forward, turn left, turn right. Each action is closed-loop:
+  it runs until the light state changes (or a timeout expires), so the
+  agent learns which way to turn rather than for how long.
+* Edge side: detected from the light transition caused by a turn
+  (see M_X / M_Y), so one table serves both lap directions.
+* Reward:  +10 for landing in MIDDLE, -10 otherwise. Exploration decays
+  as epsilon = exp(-steps / TEMP).
+* Obstacle avoidance and line recovery are hardcoded.
+
+Files
+-----
+calibration.json      light thresholds, written by calibrate.py
+q_table_v3.pkl        Q-table written by this script
+q_table_working.pkl   pre-trained table, used when q_table_v3.pkl is absent
+
+Q-tables are stored as Python literals keyed by (mode, light, action).
+Mode True means the line is on the right of the sensor (left edge);
+False means it is on the left (right edge).
+
+Commands
+--------
+python3 rl_line_follower_v3.py <command> [n]
+  status          calibration, thresholds and table audits (no motors)
+  table           print the table used by `run` (no motors)
+  seed            initialise q_table_v3.pkl from q_table_working.pkl
+  train [steps]   train until epsilon < EPSILON_STOP, or for n steps
+  run [seconds]   follow the line with the greedy policy
+
+During `run`, DOWN switches to reverse and UP returns to forward.
+
+Targets the ev3dev Python 3.5 runtime.
+"""
+
+import ast
+import json
+import math
+import os
+import random
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CALIB_JSON = os.path.join(HERE, "calibration.json")
+Q_TABLE_PATH = os.path.join(HERE, "q_table_v3.pkl")
+WORKING_Q_TABLE_PATH = os.path.join(HERE, "q_table_working.pkl")
+
+DEFAULT_COMMAND = ["status"]
+
+# =====================================================================
+# CALIBRATION
+# =====================================================================
+TARGET_INTENSITY = 21
+LOST_LINE_LOW    = 9
+LOST_LINE_HIGH   = 34
+CALIB_TIMESTAMP  = None
+
+
+def _load_calibration():
+    global TARGET_INTENSITY, LOST_LINE_LOW, LOST_LINE_HIGH, CALIB_TIMESTAMP
+    try:
+        with open(CALIB_JSON) as f:
+            c = json.load(f)
+        target = int(c["TARGET_INTENSITY"])
+        low = int(c["LOST_LINE_LOW"])
+        high = int(c["LOST_LINE_HIGH"])
+    except IOError:
+        print("No calibration.json found -> using built-in defaults "
+              "(target={} low={} high={}). Run calibrate.py!".format(
+                  TARGET_INTENSITY, LOST_LINE_LOW, LOST_LINE_HIGH))
+        return
+    except (KeyError, ValueError, TypeError) as e:
+        print("calibration.json is malformed ({}) -> using defaults.".format(e))
+        return
+    TARGET_INTENSITY, LOST_LINE_LOW, LOST_LINE_HIGH = target, low, high
+    CALIB_TIMESTAMP = c.get("timestamp")
+
+
+_load_calibration()
+
+# Half-width of the MIDDLE band as a fraction of the calibrated window.
+EDGE_BAND_FRACTION = 0.25
+
+
+def _thresholds():
+    half = max(2, int(round((LOST_LINE_HIGH - LOST_LINE_LOW) * EDGE_BAND_FRACTION)))
+    return TARGET_INTENSITY - half, TARGET_INTENSITY + half
+
+
+BLACK_VALUE, WHITE_VALUE = _thresholds()
+
+
+def current_calibration():
+    return {"TARGET_INTENSITY": TARGET_INTENSITY,
+            "LOST_LINE_LOW": LOST_LINE_LOW,
+            "LOST_LINE_HIGH": LOST_LINE_HIGH,
+            "BLACK_VALUE": BLACK_VALUE,
+            "WHITE_VALUE": WHITE_VALUE,
+            "timestamp": CALIB_TIMESTAMP}
+
+
+def calibration_problems():
+    problems = []
+    if not BLACK_VALUE < TARGET_INTENSITY < WHITE_VALUE:
+        problems.append("target {} is not between BLACK {} and WHITE {}".format(
+            TARGET_INTENSITY, BLACK_VALUE, WHITE_VALUE))
+    if WHITE_VALUE - BLACK_VALUE < 4:
+        problems.append("contrast window too narrow ({}..{})".format(
+            BLACK_VALUE, WHITE_VALUE))
+    return problems
+
+
+# =====================================================================
+# STATES, ACTIONS AND EDGE DETECTION
+# =====================================================================
+BLACK, MIDDLE, WHITE = "BLACK", "MIDDLE", "WHITE"
+LIGHT_STATES = (BLACK, MIDDLE, WHITE)
+FORWARD, TURN_LEFT, TURN_RIGHT = "forward", "turn_left", "turn_right"
+ACTIONS = (FORWARD, TURN_LEFT, TURN_RIGHT)   # ties resolve to forward
+MODES = (True, False)
+MODE_NAMES = {True: "line on right (left edge)", False: "line on left (right edge)"}
+
+# (before, action, after) transitions that identify the edge side.
+M_X = set([(MIDDLE, TURN_RIGHT, WHITE), (WHITE, TURN_LEFT, MIDDLE),
+           (MIDDLE, TURN_LEFT, BLACK), (BLACK, TURN_RIGHT, MIDDLE)])   # line on right
+M_Y = set([(MIDDLE, TURN_RIGHT, BLACK), (BLACK, TURN_LEFT, MIDDLE),
+           (MIDDLE, TURN_LEFT, WHITE), (WHITE, TURN_RIGHT, MIDDLE)])   # line on left
+
+# Greedy policy a correctly trained table should produce.
+EXPECTED_POLICY = {
+    True:  {BLACK: TURN_RIGHT, MIDDLE: FORWARD, WHITE: TURN_LEFT},
+    False: {BLACK: TURN_LEFT,  MIDDLE: FORWARD, WHITE: TURN_RIGHT},
+}
+
+
+def update_mode(mode, before, action, after):
+    t = (before, action, after)
+    if t in M_X:
+        return True
+    if t in M_Y:
+        return False
+    return mode
+
+
+# =====================================================================
+# LEARNING PARAMETERS
+# =====================================================================
+ALPHA = 0.1
+GAMMA = 0.9
+TEMP = 1000.0          # epsilon = exp(-steps / TEMP)
+EPSILON_STOP = 0.01    # training stops below this epsilon
+SEED_EPSILON = 0.2     # epsilon after `seed`
+REWARD_EDGE = 10.0
+REWARD_OFF = -10.0
+SAVE_EVERY = 50        # steps between saves
+
+
+def epsilon(iterations):
+    return math.exp(-iterations / TEMP)
+
+
+# =====================================================================
+# MOTION SETTINGS (speeds in %, times in seconds)
+# =====================================================================
+FWD_MIN_SPEED = 18     # forward speed after a turn
+FWD_MAX_SPEED = 24     # maximum forward speed
+FWD_RAMP      = 2      # speed increase per consecutive forward action
+FORWARD_TIME  = 0.25
+TURN_SPEED    = 11     # pivot component
+TURN_BIAS     = 3      # drive component during a turn
+TURN_TIMEOUT  = 4.0
+POLL          = 0.01
+
+CREEP_SPEED    = 12
+CREEP_TIME     = 0.5
+RECOVERY_TRIES = 4
+
+OBSTACLE_PROXIMITY = 25
+DETOUR_TURN_SPEED  = 20
+DETOUR_TURN_TIME   = 0.9
+DETOUR_ARC_TIME    = 1.9
+
+# =====================================================================
+# HARDWARE (initialised on demand)
+# =====================================================================
+left_motor = right_motor = color_sensor = ir_sensor = sound = buttons = None
+SpeedPercent = None
+
+
+def init_hardware():
+    global left_motor, right_motor, color_sensor, ir_sensor, sound, buttons
+    global SpeedPercent
+    if left_motor is not None:
+        return
+    from ev3dev2.motor import LargeMotor, OUTPUT_B, OUTPUT_C
+    from ev3dev2.motor import SpeedPercent as _SpeedPercent
+    from ev3dev2.sensor import INPUT_1, INPUT_4
+    from ev3dev2.sensor.lego import ColorSensor, InfraredSensor
+    from ev3dev2.sound import Sound
+    from ev3dev2.button import Button
+
+    SpeedPercent = _SpeedPercent
+    left_motor = LargeMotor(OUTPUT_B)
+    right_motor = LargeMotor(OUTPUT_C)
+    color_sensor = ColorSensor(INPUT_1)
+    color_sensor.mode = 'COL-REFLECT'
+    sound = Sound()
+    buttons = Button()
+    try:
+        ir_sensor = InfraredSensor(INPUT_4)
+    except Exception:
+        ir_sensor = None
+        print("WARNING: no IR sensor on port 4 -> obstacle avoidance disabled.")
+
+
+# =====================================================================
+# Q-TABLE I/O
+# =====================================================================
+def new_q():
+    return dict(((m, s, a), 0.0) for m in MODES for s in LIGHT_STATES for a in ACTIONS)
+
+
+def read_table(path):
+    """Return (q, iterations); iterations is None for a plain table."""
+    with open(path) as f:
+        data = ast.literal_eval(f.read().strip())
+    if isinstance(data.get("q"), dict):
+        raw, iterations = data["q"], data.get("iterations", 0)
+    else:
+        raw, iterations = data, None
+    q = new_q()
+    for key, value in raw.items():
+        if key in q:
+            q[key] = float(value)
+    return q, iterations
+
+
+def save_table(q, iterations):
+    """Write the table atomically via a temporary file."""
+    data = {"version": 3, "q": q, "iterations": iterations,
+            "calibration": current_calibration()}
+    tmp = Q_TABLE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(repr(data))
+    os.replace(tmp, Q_TABLE_PATH)
+
+
+def table_for_run():
+    path = Q_TABLE_PATH if os.path.exists(Q_TABLE_PATH) else WORKING_Q_TABLE_PATH
+    if not os.path.exists(path):
+        return None, None
+    return read_table(path)[0], path
+
+
+def best_action(q, mode, light):
+    best = ACTIONS[0]
+    for a in ACTIONS[1:]:
+        if q[(mode, light, a)] > q[(mode, light, best)]:
+            best = a
+    return best
+
+
+def audit(q):
+    """Compare the greedy policy with EXPECTED_POLICY; return True if it matches."""
+    ok = True
+    for mode in MODES:
+        parts = []
+        for light in LIGHT_STATES:
+            a = best_action(q, mode, light)
+            vals = sorted((q[(mode, light, x)] for x in ACTIONS), reverse=True)
+            good = a == EXPECTED_POLICY[mode][light]
+            ok = ok and good
+            parts.append("{}->{} (margin {:.1f}{})".format(
+                light, a, vals[0] - vals[1], "" if good else ", WRONG"))
+        print("  {:26s} {}".format(MODE_NAMES[mode], "; ".join(parts)))
+    print("  audit: {}".format("PASS" if ok else "FAIL"))
+    return ok
+
+
+def print_table(q):
+    print("{:26s} {:7s} | {:>9s} {:>9s} {:>10s} | greedy".format(
+        "mode", "light", FORWARD, TURN_LEFT, TURN_RIGHT))
+    for mode in MODES:
+        for light in LIGHT_STATES:
+            print("{:26s} {:7s} | {:9.2f} {:9.2f} {:10.2f} | {}".format(
+                MODE_NAMES[mode], light, q[(mode, light, FORWARD)],
+                q[(mode, light, TURN_LEFT)], q[(mode, light, TURN_RIGHT)],
+                best_action(q, mode, light)))
+
+
+# =====================================================================
+# SENSING AND MOTION
+# =====================================================================
+def light_state():
+    i = color_sensor.reflected_light_intensity
+    if i >= WHITE_VALUE:
+        return WHITE
+    if i <= BLACK_VALUE:
+        return BLACK
+    return MIDDLE
+
+
+def drive(ls, rs):
+    left_motor.on(SpeedPercent(ls))
+    right_motor.on(SpeedPercent(rs))
+
+
+def stop():
+    left_motor.off()
+    right_motor.off()
+
+
+_forward_streak = 0
+
+
+def do_action(action, before, direction=1, timeout=TURN_TIMEOUT):
+    """Execute one closed-loop action and return (light_after, timed_out).
+
+    A direction of -1 drives in reverse. Motors keep running between
+    actions so that motion stays smooth.
+    """
+    global _forward_streak
+    if action == FORWARD:
+        speed = min(FWD_MIN_SPEED + FWD_RAMP * _forward_streak, FWD_MAX_SPEED)
+        _forward_streak += 1
+        drive(direction * speed, direction * speed)
+        t0 = time.time()
+        while time.time() - t0 < FORWARD_TIME:
+            time.sleep(POLL)
+            after = light_state()
+            if after != before:
+                return after, False
+        return light_state(), False
+
+    _forward_streak = 0
+    turn = TURN_SPEED if action == TURN_RIGHT else -TURN_SPEED
+    drive(direction * TURN_BIAS + turn, direction * TURN_BIAS - turn)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(POLL)
+        after = light_state()
+        if after != before:
+            return after, False
+    stop()
+    return before, True
+
+
+def find_edge(mode, direction=1):
+    """Probe-turn until the light state changes and infer the edge side.
+
+    Returns (light, mode), or (None, mode) if the edge was not found.
+    """
+    for _ in range(RECOVERY_TRIES):
+        for action, timeout in ((TURN_RIGHT, TURN_TIMEOUT), (TURN_LEFT, 2 * TURN_TIMEOUT)):
+            before = light_state()
+            after, timed_out = do_action(action, before, direction, timeout)
+            if not timed_out:
+                return after, update_mode(mode, before, action, after)
+        drive(direction * CREEP_SPEED, direction * CREEP_SPEED)
+        time.sleep(CREEP_TIME)
+        stop()
+    stop()
+    return None, mode
+
+
+# =====================================================================
+# OBSTACLE AVOIDANCE
+# =====================================================================
+def obstacle_ahead():
+    return ir_sensor is not None and ir_sensor.proximity < OBSTACLE_PROXIMITY
+
+
+def avoid_obstacle():
+    sound.beep()
+    stop()
+    time.sleep(0.2)
+    drive(-CREEP_SPEED, -CREEP_SPEED)
+    time.sleep(2.0)
+    stop()
+    drive(-DETOUR_TURN_SPEED, DETOUR_TURN_SPEED)
+    time.sleep(DETOUR_TURN_TIME)
+    drive(int(DETOUR_TURN_SPEED * 1.4), int(DETOUR_TURN_SPEED * 0.6))
+    time.sleep(DETOUR_ARC_TIME)
+    stop()
+
+
+# =====================================================================
+# TRAINING
+# =====================================================================
+def train(max_steps=None):
+    problems = calibration_problems()
+    if problems:
+        print("Calibration unusable: " + "; ".join(problems))
+        return
+    if os.path.exists(Q_TABLE_PATH):
+        q, iterations = read_table(Q_TABLE_PATH)
+        iterations = iterations or 0
+    else:
+        q, iterations = new_q(), 0
+    print("Training | steps so far={} | epsilon={:.3f} | BLACK<={} WHITE>={}".format(
+        iterations, epsilon(iterations), BLACK_VALUE, WHITE_VALUE))
+    if epsilon(iterations) < EPSILON_STOP and not max_steps:
+        print("Already converged (epsilon < {}). Pass a step count to train more.".format(
+            EPSILON_STOP))
+        return
+
+    sound.beep()
+    light, mode = find_edge(True)
+    if light is None:
+        print("Could not find the edge. Place the robot on the line and retry.")
+        return
+    steps = 0
+    try:
+        while True:
+            eps = epsilon(iterations)
+            if max_steps is not None:
+                if steps >= max_steps:
+                    break
+            elif eps < EPSILON_STOP:
+                break
+            if random.random() < eps:
+                action = random.choice(ACTIONS)
+            else:
+                action = best_action(q, mode, light)
+
+            after, timed_out = do_action(action, light)
+            new_mode = update_mode(mode, light, action, after)
+            reward = REWARD_EDGE if after == MIDDLE else REWARD_OFF
+            next_max = max(q[(new_mode, after, a)] for a in ACTIONS)
+            key = (mode, light, action)
+            q[key] += ALPHA * (reward + GAMMA * next_max - q[key])
+            iterations += 1
+            steps += 1
+
+            if iterations % SAVE_EVERY == 0:
+                save_table(q, iterations)
+                print("step {} | eps={:.3f} | {} | {} -{}-> {}".format(
+                    iterations, eps, MODE_NAMES[new_mode], light, action, after))
+
+            if timed_out:
+                after, new_mode = find_edge(new_mode)
+                if after is None:
+                    print("Lost the line and could not recover -> stopping.")
+                    break
+            light, mode = after, new_mode
+    except KeyboardInterrupt:
+        print("Interrupted.")
+    finally:
+        stop()
+        save_table(q, iterations)
+    print("Saved {} after {} total steps (epsilon {:.3f}).".format(
+        Q_TABLE_PATH, iterations, epsilon(iterations)))
+    audit(q)
+
+
+def seed():
+    """Initialise q_table_v3.pkl from the pre-trained working table."""
+    if os.path.exists(Q_TABLE_PATH):
+        print("{} already exists; not overwriting it.".format(Q_TABLE_PATH))
+        return False
+    if not os.path.exists(WORKING_Q_TABLE_PATH):
+        print("No {} to seed from.".format(WORKING_Q_TABLE_PATH))
+        return False
+    q = read_table(WORKING_Q_TABLE_PATH)[0]
+    iterations = int(round(-TEMP * math.log(SEED_EPSILON)))
+    save_table(q, iterations)
+    print("Seeded {} from {}; training resumes at epsilon {}.".format(
+        Q_TABLE_PATH, WORKING_Q_TABLE_PATH, SEED_EPSILON))
+    return True
+
+
+# =====================================================================
+# RUN
+# =====================================================================
+def run(duration_sec):
+    q, path = table_for_run()
+    if q is None:
+        print("No Q-table found ({} or {}).".format(Q_TABLE_PATH, WORKING_Q_TABLE_PATH))
+        return
+    print("Using {}".format(path))
+    if not audit(q):
+        print("WARNING: the table fails its audit; expect poor following.")
+
+    direction = 1
+    light, mode = find_edge(True, direction)
+    if light is None:
+        print("Could not find the edge. Place the robot on the line and retry.")
+        return
+    print("Following: {}. DOWN = reverse, UP = forward.".format(MODE_NAMES[mode]))
+    pressed_before = set()
+    lost_count = 0
+    start = time.time()
+
+    while time.time() - start < duration_sec:
+        pressed = set(n for n in ("down", "up") if getattr(buttons, n))
+        new_presses = pressed - pressed_before
+        pressed_before = pressed
+        if "down" in new_presses and direction == 1:
+            direction = -1
+            stop()
+            sound.beep()
+            print("Reverse.")
+        elif "up" in new_presses and direction == -1:
+            direction = 1
+            stop()
+            sound.beep()
+            print("Forward.")
+
+        if direction == 1 and obstacle_ahead():
+            print("Obstacle! Detouring...")
+            avoid_obstacle()
+            light, mode = find_edge(mode, direction)
+            if light is None:
+                print("Could not re-find the line after the detour.")
+                break
+            sound.beep()
+            print("Back on the line: {}.".format(MODE_NAMES[mode]))
+            continue
+
+        action = best_action(q, mode, light)
+        after, timed_out = do_action(action, light, direction)
+        mode = update_mode(mode, light, action, after)
+        light = after
+        if timed_out:
+            lost_count += 1
+            print("Lost the line (#{}) -> searching...".format(lost_count))
+            light, mode = find_edge(mode, direction)
+            if light is None:
+                print("Could not realign, stopping.")
+                break
+
+    stop()
+    print("Run finished. Lost the line {} time(s).".format(lost_count))
+
+
+# =====================================================================
+# COMMANDS AND ENTRY POINT
+# =====================================================================
+def cmd_status():
+    print("Calibration ({}): target={} low={} high={}".format(
+        CALIB_TIMESTAMP or "defaults", TARGET_INTENSITY, LOST_LINE_LOW, LOST_LINE_HIGH))
+    print("Light states: BLACK <= {} < MIDDLE < {} <= WHITE".format(BLACK_VALUE, WHITE_VALUE))
+    for p in calibration_problems():
+        print("  problem: " + p)
+    for path in (WORKING_Q_TABLE_PATH, Q_TABLE_PATH):
+        if not os.path.exists(path):
+            print("{}: missing".format(os.path.basename(path)))
+            continue
+        q, iterations = read_table(path)
+        print("{}: {}".format(os.path.basename(path), "no step count" if iterations is None
+                              else "{} steps, epsilon {:.3f}".format(
+                                  iterations, epsilon(iterations))))
+        audit(q)
+    q, path = table_for_run()
+    print("run uses: {}".format(os.path.basename(path) if path else "nothing"))
+
+
+def cmd_table():
+    q, path = table_for_run()
+    if q is None:
+        print("No Q-table found.")
+        return False
+    print(path)
+    print_table(q)
+
+
+USAGE = """usage: python3 {0} <command> [n]
+  status          thresholds, tables and audits (no motors)
+  table           print the table `run` would use (no motors)
+  seed            q_table_v3.pkl := q_table_working.pkl (epsilon {1})
+  train [steps]   learn until epsilon < {2}, or for n steps
+  run [seconds]   follow the line (default 150 s)
+""".format(os.path.basename(__file__), SEED_EPSILON, EPSILON_STOP)
+
+OFFLINE_COMMANDS = {"status": cmd_status, "table": cmd_table, "seed": seed}
+
+
+def main(argv):
+    if not argv:
+        argv = DEFAULT_COMMAND
+    cmd = argv[0]
+    try:
+        arg = int(argv[1]) if len(argv) > 1 else None
+    except ValueError:
+        print(USAGE)
+        return 1
+    if arg is not None and arg <= 0:
+        print("The count must be a positive number.")
+        return 1
+
+    if cmd in OFFLINE_COMMANDS:
+        return 1 if OFFLINE_COMMANDS[cmd]() is False else 0
+    if cmd not in ("train", "run"):
+        print(USAGE)
+        return 1
+
+    init_hardware()
+    try:
+        if cmd == "train":
+            train(arg)
+        else:
+            run(arg or 150)
+    finally:
+        stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
